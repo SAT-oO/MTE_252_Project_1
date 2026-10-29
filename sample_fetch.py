@@ -6,6 +6,7 @@ Target: 30-60 s, >=16 kHz mono WAV.
 """
 
 import os
+import sys
 import tarfile
 import zipfile
 import urllib.request
@@ -16,25 +17,89 @@ try:
     import soundfile as sf
     import numpy as np
     from scipy import signal
+    from tqdm import tqdm
 except ImportError:
-    print("Installing required packages: soundfile scipy numpy")
-    os.system("pip install soundfile scipy numpy -q")
+    print("Installing required packages: soundfile scipy numpy tqdm")
+    os.system("pip install soundfile scipy numpy tqdm -q")
     import soundfile as sf
     import numpy as np
     from scipy import signal
+    from tqdm import tqdm
 
 OUT_DIR = Path("samples")
 OUT_DIR.mkdir(exist_ok=True)
 TMP = Path("tmp_audio")
 TMP.mkdir(exist_ok=True)
 
+class _OneLine:
+    """Keep tqdm on a single terminal line (IDE terminals often wrap or ignore \\r)."""
+
+    def __init__(self, stream):
+        self._s = stream
+
+    def write(self, text):
+        if not text:
+            return 0
+        if text.startswith("\r"):
+            text = "\r\033[2K" + text[1:]
+        self._s.write(text)
+        return len(text)
+
+    def flush(self):
+        self._s.flush()
+
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        return self._s.fileno()
+
+
+def pbar(*args, **kwargs):
+    kwargs.setdefault("file", _OneLine(sys.stderr))
+    kwargs.setdefault("ncols", 72)
+    kwargs.setdefault("mininterval", 0.5)
+    kwargs.setdefault("leave", True)
+    kwargs.setdefault("ascii", True)
+    kwargs.setdefault("dynamic_ncols", False)
+    return tqdm(*args, **kwargs)
+
 def download(url, dest):
+    size = dest.stat().st_size if dest.exists() else 0
+    expected = 0
+    if size > 0:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method="HEAD")) as r:
+                expected = int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            expected = 0
+        if not expected or size == expected:
+            tqdm.write(f"Already have {dest}")
+            return
+        tqdm.write(f"Truncated {dest} ({size}/{expected}), re-downloading")
     if dest.exists():
-        print(f"Already have {dest}")
-        return
-    print(f"Downloading {url} ...")
-    urllib.request.urlretrieve(url, dest)
-    print(f"Saved {dest}")
+        dest.unlink()
+    req = urllib.request.urlopen(url)
+    total = int(req.headers.get("Content-Length") or 0)
+    desc = f"Download {dest.name}"
+    with open(dest, "wb") as out, pbar(
+        total=total or None,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        desc=desc,
+    ) as bar:
+        while True:
+            chunk = req.read(1024 * 256)
+            if not chunk:
+                break
+            out.write(chunk)
+            bar.update(len(chunk))
+    got = dest.stat().st_size
+    if total and got != total:
+        dest.unlink()
+        raise OSError(f"Incomplete download {dest} ({got}/{total})")
+    tqdm.write(f"Saved {dest}")
 
 def resample_to_16k(data, sr):
     if sr == 16000:
@@ -45,9 +110,14 @@ def resample_to_16k(data, sr):
 
 def concat_and_save(files, out_name, target_sr=16000, target_len_sec=40):
     """Concatenate audio files until roughly target length, save as 16k mono WAV."""
+    out_path = OUT_DIR / out_name
+    if out_path.exists() and out_path.stat().st_size > 0:
+        tqdm.write(f"Already have {out_path}")
+        return
     pieces = []
     total = 0.0
-    for f in files:
+    label = out_name.replace(".wav", "")
+    for f in pbar(files, desc=label, unit="file"):
         data, sr = sf.read(f)
         if data.ndim > 1:
             data = data.mean(axis=1)
@@ -57,7 +127,7 @@ def concat_and_save(files, out_name, target_sr=16000, target_len_sec=40):
         if total >= target_len_sec:
             break
     if not pieces:
-        print(f"WARNING: no audio for {out_name}")
+        tqdm.write(f"WARNING: no audio for {out_name}")
         return
     combined = np.concatenate(pieces)
     # trim / pad to ~40 s
@@ -66,9 +136,8 @@ def concat_and_save(files, out_name, target_sr=16000, target_len_sec=40):
         combined = combined[:target_samples]
     else:
         combined = np.pad(combined, (0, max(0, target_samples - len(combined))))
-    out_path = OUT_DIR / out_name
     sf.write(out_path, combined, 16000)
-    print(f"Created {out_path} ({len(combined)/16000:.1f}s)")
+    tqdm.write(f"Created {out_path} ({len(combined)/16000:.1f}s)")
 
 def main():
     # 1. Mini LibriSpeech (clean male/female, 16 kHz FLAC)
@@ -76,15 +145,22 @@ def main():
     mini_tar = TMP / "dev-clean-2.tar.gz"
     download(mini_url, mini_tar)
 
-    with tarfile.open(mini_tar, "r:gz") as tar:
-        tar.extractall(TMP)
-
     # Typical structure after extract: TMP/LibriSpeech/dev-clean-2/...
-    libri_root = list(TMP.rglob("dev-clean-2"))[0] if list(TMP.rglob("dev-clean-2")) else TMP / "LibriSpeech" / "dev-clean-2"
+    found = list(TMP.rglob("dev-clean-2"))
+    libri_root = found[0] if found else TMP / "LibriSpeech" / "dev-clean-2"
+    if not (libri_root.exists() and any(libri_root.rglob("*.flac"))):
+        with tarfile.open(mini_tar, "r:gz") as tar:
+            members = tar.getmembers()
+            for member in pbar(members, desc="Extract LibriSpeech", unit="file"):
+                tar.extract(member, TMP)
+        found = list(TMP.rglob("dev-clean-2"))
+        libri_root = found[0] if found else TMP / "LibriSpeech" / "dev-clean-2"
+    else:
+        tqdm.write(f"Already extracted Mini LibriSpeech")
 
     # Collect some male / female files (we will pick known speakers later if needed)
     all_flacs = sorted(libri_root.rglob("*.flac"))
-    print(f"Found {len(all_flacs)} FLAC files in Mini LibriSpeech")
+    tqdm.write(f"Found {len(all_flacs)} FLAC files in Mini LibriSpeech")
 
     # Simple split: first half roughly one gender group, second half another
     # (for robustness we just take sequential groups)
@@ -98,16 +174,21 @@ def main():
     try:
         download(val_url, val_zip)
     except Exception as e:
-        print("Valentini direct link may have changed. Trying alternative approach / skipping noisy for now.")
-        print(e)
+        tqdm.write("Valentini direct link may have changed. Trying alternative approach / skipping noisy for now.")
+        tqdm.write(str(e))
         val_zip = None
 
-    noisy_files = []
-    if val_zip and val_zip.exists():
+    dest_root = TMP / "valentini"
+    noisy_files = sorted(dest_root.rglob("*.wav"))[:20] if dest_root.exists() else []
+    if noisy_files:
+        tqdm.write(f"Already extracted Valentini ({len(noisy_files)} WAV)")
+    elif val_zip and val_zip.exists():
         with zipfile.ZipFile(val_zip, "r") as z:
-            z.extractall(TMP / "valentini")
-        noisy_files = sorted((TMP / "valentini").rglob("*.wav"))[:20]
-        print(f"Found {len(noisy_files)} noisy WAV files")
+            names = z.namelist()
+            for name in pbar(names, desc="Extract Valentini", unit="file"):
+                z.extract(name, dest_root)
+        noisy_files = sorted(dest_root.rglob("*.wav"))[:20]
+        tqdm.write(f"Found {len(noisy_files)} noisy WAV files")
 
     # ---------- Build the 10 samples ----------
     # Female 1 & 2 (from LibriSpeech)
