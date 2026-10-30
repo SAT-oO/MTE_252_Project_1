@@ -1,3 +1,2 @@
 __pycache__/
-tmp_audio/*
-samples/*
+audio_sampling/*
