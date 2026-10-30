@@ -7,7 +7,7 @@ Target: 30-60 s, >=16 kHz, 16-bit, mono WAV.
 Genders come from LibriSpeech SPEAKERS.TXT, not file order.
 Child clips are ENNI story retells (child turns only).
 Multi-speaker clips alternate a male reader and a female reader.
-If a sample wav is already in samples/, it is left as-is and not fetched again.
+If a sample wav is already in audio_sampling/tmp_audio/, it is left as-is and not fetched again.
 """
 
 import io
@@ -31,10 +31,10 @@ except ImportError:
     from scipy import signal
     from tqdm import tqdm
 
-OUT_DIR = Path("samples")
-OUT_DIR.mkdir(exist_ok=True)
 TMP = Path("tmp_audio")
 TMP.mkdir(exist_ok=True)
+OUT_DIR = Path("audio_sampling") / "tmp_audio"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 SR = 16000
 UA = {"User-Agent": "Mozilla/5.0 (compatible; MTE252-sample-fetch/1.0)"}
 
@@ -423,7 +423,7 @@ def main():
     build_child()
     build_noisy()
     check_samples()
-    print("\nDone. 10 samples are in the 'samples/' folder.")
+    print("\nDone. 10 samples are in the 'audio_sampling/tmp_audio/' folder.")
 
 
 if __name__ == "__main__":
